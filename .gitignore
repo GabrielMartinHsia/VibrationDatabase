@@ -1,0 +1,15 @@
+# Python / venv
+.venv/
+__pycache__/
+*.pyc
+
+# Editor settings
+.vscode/
+.idea/
+
+# Streamlit local stuff (if you ever add project-level config)
+.streamlit/
+
+# Raw data (big, not needed in repo)
+Data/
+*.IDE
