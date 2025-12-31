@@ -13,3 +13,7 @@ __pycache__/
 # Raw data (big, not needed in repo)
 Data/
 *.IDE
+
+# The database will be very large, much bigger than github's 100 MB limit:
+*.db
+vibes.db
