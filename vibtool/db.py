@@ -37,6 +37,16 @@ def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(row[1] == column for row in cur.fetchall())
 
 
+def ensure_measurement_type_field(conn):
+    cur = conn.cursor()
+    # Add column if missing
+    cur.execute("PRAGMA table_info(measurement_run)")
+    cols = {row[1] for row in cur.fetchall()}
+    if "measurement_type" not in cols:
+        cur.execute("ALTER TABLE measurement_run ADD COLUMN measurement_type TEXT DEFAULT 'route'")
+        conn.commit()
+
+
 def ensure_ide_fingerprint_fields(conn: sqlite3.Connection) -> None:
     """Best-effort migration for older DBs.
 

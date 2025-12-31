@@ -129,6 +129,7 @@ def insert_measurement_run(
     ide_sha256: str,
     operating_state: str,
     notes: str | None,
+    measurement_type: str,
     dry_run: bool,
 ) -> int | None:
     if dry_run:
@@ -143,11 +144,12 @@ def insert_measurement_run(
             operating_state,
             ide_file_path,
             ide_sha256,
-            notes
+            notes,
+            measurement_type
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (location_id, timestamp_utc, operating_state, ide_file_path, ide_sha256, notes),
+        (location_id, timestamp_utc, operating_state, ide_file_path, ide_sha256, notes, measurement_type),
     )
     conn.commit()
     return cur.lastrowid
@@ -211,6 +213,9 @@ def main() -> None:
         except ValueError:
             ide_rel = str(ide_path)
 
+        parts_lower = [p.lower() for p in ide_path.parts]
+        measurement_type = "sweep" if "sweeps" in parts_lower else "route"
+
         try:
             loc_name = infer_location_name(ide_path)
         except Exception as e:
@@ -263,6 +268,7 @@ def main() -> None:
             ide_sha256=ide_hash,
             operating_state=args.operating_state,
             notes=args.notes,
+            measurement_type=measurement_type,
             dry_run=args.dry_run,
         )
 

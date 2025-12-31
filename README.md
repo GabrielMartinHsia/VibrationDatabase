@@ -59,7 +59,7 @@ Compute FFTs for new readings
 
 Run:
 
-python -m Scripts.store_fft_for_all_readings
+python -m Scripts.store_ffts_for_each_ide
 
 
 Script finds readings without FFTs and computes spectra for X/Y/Z.
@@ -94,3 +94,18 @@ Orientation-aware axes (horizontal / vertical / axial)
 Min/max frequency controls (min_freq hides DC spike by default)
 
 Overlaid FFTs for quick comparison
+
+## Ingest New Machine Route Data:
+After saving the .IDE files to the correct folder with formatted names (YYMMDD_RXX_LXX.IDE), run the following scripts at the terminal in the (.venv) for this project:
+
+1. Ingest new data:
+
+`python -m Scripts.ingest_new`
+
+2. Compute and store FFT readings for the newly ingested data:
+
+`python -m Scripts.store_ffts_for_each_ide
+
+Now you can launch the dashboard to view the FFTs, either by double clicking the icon on your desktop and navigating to "localhost:8501", or in the terminal with:
+
+`streamlit run Scripts\fft_dashboard.py

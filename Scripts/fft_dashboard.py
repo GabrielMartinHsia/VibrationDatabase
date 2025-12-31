@@ -14,6 +14,9 @@ import plotly.graph_objects as go
 from vibtool.db import load_config
 from vibtool.fft_helpers import blob_to_array
 
+import re
+from collections import defaultdict
+
 
 # ---------- DB helpers ----------
 
@@ -54,6 +57,62 @@ def get_locations_for_pump(conn, site, pump_name):
         (site, pump_name),
     )
     return cur.fetchall()
+
+def get_all_readings_for_pump(conn, site, pump_name):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT mr.reading_id, mr.location_id, mr.timestamp_utc, mr.ide_file_path
+        FROM measurement_run mr
+        JOIN measurement_location ml ON mr.location_id = ml.location_id
+        JOIN pump p ON ml.pump_id = p.pump_id
+        WHERE p.site = ? AND p.name = ?
+        ORDER BY mr.timestamp_utc DESC;
+        """,
+        (site, pump_name),
+    )
+    return cur.fetchall()
+
+
+_NEW_FMT = re.compile(r"^(?P<yymmdd>\d{6})_R(?P<run>\d{1,6})_L\d{2}$", re.IGNORECASE)
+_OLD_FMT = re.compile(r"^(?P<yymmdd>\d{6})_(?P<hhmmss>\d{6})_L\d{2}$", re.IGNORECASE)
+
+def compute_run_key(ide_file_path: str) -> str | None:
+    p = Path(ide_file_path)
+    stem = p.stem
+
+    m = _NEW_FMT.match(stem)
+    if m:
+        run_num = int(m.group("run"))  # works for R1, R01, R001
+        return f"{m.group('yymmdd')}_R{run_num:02d}"
+
+    m = _OLD_FMT.match(stem)
+    if m:
+        return m.group("yymmdd")
+
+    return None
+
+
+def build_runs_index(reading_rows):
+    """
+    Returns:
+      runs: dict[run_key] -> list[sqlite3.Row]
+      run_order: list[run_key] sorted newest->oldest by max timestamp_utc
+    """
+    runs = defaultdict(list)
+    newest_ts = {}
+
+    for r in reading_rows:
+        rk = compute_run_key(r["ide_file_path"])
+        if rk is None:
+            continue
+        runs[rk].append(r)
+        ts = r["timestamp_utc"]
+        if rk not in newest_ts or ts > newest_ts[rk]:
+            newest_ts[rk] = ts
+
+    run_order = sorted(newest_ts.keys(), key=lambda k: newest_ts[k], reverse=True)
+    return runs, run_order
 
 
 def get_latest_reading_for_location(conn, location_id):
@@ -169,12 +228,35 @@ def main():
         step=10.0,
     )
 
-
     mode = st.sidebar.radio(
         "Reading selection",
-        ["Latest per location"],  # we can add more modes later
+        ["Latest per location", "Select run", "Compare two runs"],
         index=0,
     )
+
+    all_readings = get_all_readings_for_pump(conn, site, pump_name)
+    runs, run_order = build_runs_index(all_readings)
+
+    selected_run = None
+    run_a = None
+    run_b = None
+
+    if mode in ("Select run", "Compare two runs"):
+        if not run_order:
+            st.sidebar.error("No run keys could be derived from filenames. (Check naming convention.)")
+            return
+
+        # Nice labels showing newest timestamp
+        # (We already have readings sorted by timestamp desc, but we’ll compute labels simply.)
+        run_labels = run_order
+
+        if mode == "Select run":
+            selected_run = st.sidebar.selectbox("Run", run_labels, index=0)
+
+        if mode == "Compare two runs":
+            run_a = st.sidebar.selectbox("Run A", run_labels, index=0)
+            run_b = st.sidebar.selectbox("Run B", run_labels, index=min(1, len(run_labels)-1))
+
 
     st.sidebar.markdown("---")
     st.sidebar.caption("FFT data from vibes.db")
@@ -206,11 +288,20 @@ def main():
 
         if desired_orientation not in orientation_to_axis:
             st.write(
-                f"⚠️ {loc_name}: no device axis mapped to '{desired_orientation}', skipping."
+                f" {loc_name}: no device axis mapped to '{desired_orientation}', skipping."
             )
             continue
 
         axis = orientation_to_axis[desired_orientation]
+
+
+        def pick_reading_for_location_from_run(run_key: str, location_id: int):
+            # If there are multiple (shouldn't be), pick the newest timestamp_utc
+            candidates = [r for r in runs.get(run_key, []) if r["location_id"] == location_id]
+            if not candidates:
+                return None
+            return max(candidates, key=lambda r: r["timestamp_utc"])
+
 
         if mode == "Latest per location":
             reading = get_latest_reading_for_location(conn, loc_id)
@@ -220,54 +311,84 @@ def main():
 
             reading_id = reading["reading_id"]
             timestamp = reading["timestamp_utc"]
+
             fft_data = get_fft_for_reading(conn, reading_id, axis)
             if fft_data is None:
-                st.write(
-                    f"⚠️ {loc_name}: no FFT for reading {reading_id}, axis {axis}, skipping."
-                )
+                st.write(f" {loc_name}: no FFT for reading {reading_id}, axis {axis}, skipping.")
                 continue
 
             freqs, mag, fs, nfft = fft_data
-
-            # Apply BOTH min and max frequency limits
             mask = (freqs >= min_freq) & (freqs <= max_freq)
             if not mask.any():
-                st.write(
-                    f"{loc_name}: no frequencies between {min_freq} and {max_freq} Hz, skipping."
-                )
+                st.write(f"{loc_name}: no frequencies between {min_freq} and {max_freq} Hz, skipping.")
                 continue
 
-            freqs_plot = freqs[mask]
-            mag_plot = mag[mask]
-
-
-            freqs_plot = freqs[mask]
-            mag_plot = mag[mask]
-
-            label = f"{loc_name} ({desired_orientation}) — {timestamp}"
-
-            fig.add_trace(
-                go.Scatter(
-                    x=freqs_plot,
-                    y=mag_plot,
-                    mode="lines",
-                    name=label,
-                )
-            )
+            fig.add_trace(go.Scatter(
+                x=freqs[mask],
+                y=mag[mask],
+                mode="lines",
+                name=f"{loc_name} ({desired_orientation}) — {timestamp}",
+            ))
             n_traces += 1
+
+        elif mode == "Select run":
+            r = pick_reading_for_location_from_run(selected_run, loc_id)
+            if r is None:
+                st.write(f"{loc_name}: no reading found in run {selected_run}, skipping.")
+                continue
+
+            reading_id = r["reading_id"]
+            timestamp = r["timestamp_utc"]
+
+            fft_data = get_fft_for_reading(conn, reading_id, axis)
+            if fft_data is None:
+                st.write(f" {loc_name}: no FFT for reading {reading_id}, axis {axis}, skipping.")
+                continue
+
+            freqs, mag, fs, nfft = fft_data
+            mask = (freqs >= min_freq) & (freqs <= max_freq)
+            if not mask.any():
+                st.write(f"{loc_name}: no frequencies between {min_freq} and {max_freq} Hz, skipping.")
+                continue
+
+            fig.add_trace(go.Scatter(
+                x=freqs[mask],
+                y=mag[mask],
+                mode="lines",
+                name=f"{loc_name} ({desired_orientation}) — {selected_run}",
+            ))
+            n_traces += 1
+
+        elif mode == "Compare two runs":
+            for rk in (run_a, run_b):
+                r = pick_reading_for_location_from_run(rk, loc_id)
+                if r is None:
+                    # Don't spam warnings twice; just skip missing combos
+                    continue
+
+                reading_id = r["reading_id"]
+                fft_data = get_fft_for_reading(conn, reading_id, axis)
+                if fft_data is None:
+                    continue
+
+                freqs, mag, fs, nfft = fft_data
+                mask = (freqs >= min_freq) & (freqs <= max_freq)
+                if not mask.any():
+                    continue
+
+                fig.add_trace(go.Scatter(
+                    x=freqs[mask],
+                    y=mag[mask],
+                    mode="lines",
+                    name=f"{loc_name} ({desired_orientation}) — {rk}",
+                ))
+                n_traces += 1
+
 
     if n_traces == 0:
         st.warning("No FFT traces to display with the current selection.")
         return
 
-    # title = f"FFT Comparison — {site} / {pump_name} — {desired_orientation.capitalize()}"
-    # fig.update_layout(
-    #     title=title,
-    #     xaxis_title="Frequency (Hz)",
-    #     yaxis_title="Magnitude (g)",
-    #     template="plotly_white",
-    #     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-    # )
 
     title = f"FFT Comparison — {site} / {pump_name} — {desired_orientation.capitalize()}"
     fig.update_layout(
