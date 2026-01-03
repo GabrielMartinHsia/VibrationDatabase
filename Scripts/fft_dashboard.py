@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import numpy as np
 
 # Ensure project root (the folder containing 'vibtool') is on sys.path
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,7 +12,7 @@ import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 
-from vibtool.db import load_config
+from vibtool.db import load_config, infer_sort_key_from_ide_path
 from vibtool.fft_helpers import blob_to_array
 
 import re
@@ -93,41 +94,88 @@ def compute_run_key(ide_file_path: str) -> str | None:
     return None
 
 
+# def build_runs_index(reading_rows):
+#     """
+#     Returns:
+#       runs: dict[run_key] -> list[sqlite3.Row]
+#       run_order: list[run_key] sorted newest->oldest by max timestamp_utc
+#     """
+#     runs = defaultdict(list)
+#     newest_ts = {}
+
+#     for r in reading_rows:
+#         rk = compute_run_key(r["ide_file_path"])
+#         if rk is None:
+#             continue
+#         runs[rk].append(r)
+#         ts = r["timestamp_utc"]
+#         if rk not in newest_ts or ts > newest_ts[rk]:
+#             newest_ts[rk] = ts
+
+#     run_order = sorted(newest_ts.keys(), key=lambda k: newest_ts[k], reverse=True)
+#     return runs, run_order
 def build_runs_index(reading_rows):
     """
     Returns:
       runs: dict[run_key] -> list[sqlite3.Row]
-      run_order: list[run_key] sorted newest->oldest by max timestamp_utc
+      run_order: list[run_key] sorted newest->oldest by run_key (YYMMDD_R##)
     """
     runs = defaultdict(list)
-    newest_ts = {}
 
     for r in reading_rows:
         rk = compute_run_key(r["ide_file_path"])
         if rk is None:
             continue
         runs[rk].append(r)
-        ts = r["timestamp_utc"]
-        if rk not in newest_ts or ts > newest_ts[rk]:
-            newest_ts[rk] = ts
 
-    run_order = sorted(newest_ts.keys(), key=lambda k: newest_ts[k], reverse=True)
+    # Sort by the run_key itself (works because rk is YYMMDD_R##)
+    run_order = sorted(runs.keys(), reverse=True)
     return runs, run_order
 
 
-def get_latest_reading_for_location(conn, location_id):
+
+def get_latest_reading_for_location(conn, location_id: int):
+    """
+    Choose 'latest' based on filename convention (YYMMDD_R## preferred),
+    because device timestamps may be unreliable.
+    """
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT reading_id, timestamp_utc
+        SELECT reading_id, location_id, timestamp_utc, ide_file_path
         FROM measurement_run
         WHERE location_id = ?
-        ORDER BY timestamp_utc DESC
-        LIMIT 1;
+          AND COALESCE(measurement_type, 'route') = 'route'
         """,
         (location_id,),
     )
-    return cur.fetchone()
+    rows = cur.fetchall()
+    if not rows:
+        return None
+
+    # rows: (reading_id, location_id, timestamp_utc, ide_file_path)
+    best = None
+    best_key = None
+
+    for reading_id, loc_id, ts, ide_path in rows:
+        k = infer_sort_key_from_ide_path(ide_path)
+        # fallback so we always pick something deterministic
+        if k is None:
+            k = (-1, -1, 9)
+
+        # include reading_id as a final tie-breaker
+        full_key = (k[0], k[1], -k[2], reading_id)
+
+        if best is None or full_key > best_key:
+            best = {
+                "reading_id": reading_id,
+                "location_id": loc_id,
+                "timestamp_utc": ts,
+                "ide_file_path": ide_path,
+            }
+            best_key = full_key
+
+    return best
 
 
 def get_fft_for_reading(conn, reading_id, axis):
@@ -150,6 +198,42 @@ def get_fft_for_reading(conn, reading_id, axis):
     mag = blob_to_array(blob)
     freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
     return freqs, mag, fs, nfft
+
+
+def accel_mag_g_to_velocity_mag_in_s(mag_g: np.ndarray, freqs_hz: np.ndarray) -> np.ndarray:
+    """
+    Convert acceleration spectrum magnitude in g (0-pk, amplitude spectrum)
+    to velocity spectrum magnitude in in/s (0-pk) via V = A / (2*pi*f).
+    """
+    g_to_m_s2 = 9.81
+    m_to_mm = 1000.0
+    mm_to_in = 1.0 / 25.4
+
+    f = freqs_hz.astype(float).copy()
+    f[0] = np.inf  # avoid divide-by-zero at DC
+
+    vel = (mag_g * g_to_m_s2) / (2.0 * np.pi * f) * m_to_mm * mm_to_in
+    vel[0] = 0.0
+    return vel
+
+
+def transform_fft_for_display(freqs: np.ndarray, mag_g: np.ndarray, display_mode: str) -> tuple[np.ndarray, np.ndarray, str]:
+    """
+    Returns (freqs, mag, y_label)
+    mag input is acceleration magnitude in g (0-pk) from DB.
+    """
+    if display_mode.startswith("Velocity"):
+        g_to_m_s2 = 9.81
+        m_to_mm = 1000.0
+        mm_to_in = 1.0 / 25.4
+
+        f = freqs.astype(float).copy()
+        f[0] = np.inf
+        mag = (mag_g * g_to_m_s2) / (2.0 * np.pi * f) * m_to_mm * mm_to_in
+        mag[0] = 0.0
+        return freqs, mag, "Velocity (in/s) (0-pk)"
+
+    return freqs, mag_g, "Acceleration (g) (0-pk)"
 
 
 # ---------- App logic ----------
@@ -181,6 +265,15 @@ def main():
     if not loc_rows:
         st.sidebar.error(f"No locations found for {site} / {pump_name}.")
         return
+
+    loc_label_map = {
+        row["location_id"]: (
+            f"{row['name']} — {row['description']}".strip()
+            if row["description"]
+            else row["name"]
+        )
+        for row in loc_rows
+    }
 
     loc_labels = [f"{row['name']} — {row['description']}" if row["description"] else row["name"]
                   for row in loc_rows]
@@ -234,6 +327,14 @@ def main():
         index=0,
     )
 
+    display_mode = st.sidebar.radio(
+        "Display",
+        ["Acceleration (g)", "Velocity (in/s)"],
+        index=0,
+    )
+
+    y_label = "Velocity (in/s) (0-pk)" if display_mode.startswith("Velocity") else "Acceleration (g) (0-pk)"
+
     all_readings = get_all_readings_for_pump(conn, site, pump_name)
     runs, run_order = build_runs_index(all_readings)
 
@@ -243,7 +344,7 @@ def main():
 
     if mode in ("Select run", "Compare two runs"):
         if not run_order:
-            st.sidebar.error("No run keys could be derived from filenames. (Check naming convention.)")
+            st.sidebar.error("No run keys could be derived from filenames. (Check naming convention YYMMDD_RXX_LXX.)")
             return
 
         # Nice labels showing newest timestamp
@@ -269,9 +370,12 @@ def main():
     fig = go.Figure()
     n_traces = 0
 
+    used_run_keys = set()
+
     for loc_id in selected_loc_ids:
         loc_name = loc_name_map[loc_id]
         orient_info = loc_orient_map[loc_id]
+        trace_label = loc_label_map.get(loc_id, loc_name)
 
         # Map desired physical orientation → device axis
         x_dir = orient_info["x_dir"]
@@ -309,8 +413,11 @@ def main():
                 st.write(f"{loc_name}: no readings found, skipping.")
                 continue
 
+            rk = compute_run_key(reading["ide_file_path"])
+            if rk:
+                used_run_keys.add(rk)
+
             reading_id = reading["reading_id"]
-            timestamp = reading["timestamp_utc"]
 
             fft_data = get_fft_for_reading(conn, reading_id, axis)
             if fft_data is None:
@@ -318,6 +425,7 @@ def main():
                 continue
 
             freqs, mag, fs, nfft = fft_data
+            freqs, mag, y_label = transform_fft_for_display(freqs, mag, display_mode)
             mask = (freqs >= min_freq) & (freqs <= max_freq)
             if not mask.any():
                 st.write(f"{loc_name}: no frequencies between {min_freq} and {max_freq} Hz, skipping.")
@@ -327,7 +435,8 @@ def main():
                 x=freqs[mask],
                 y=mag[mask],
                 mode="lines",
-                name=f"{loc_name} ({desired_orientation}) — {timestamp}",
+                # name=f"{loc_name} ({desired_orientation}) — {Path(reading['ide_file_path']).stem}",
+                name=trace_label,
             ))
             n_traces += 1
 
@@ -346,6 +455,7 @@ def main():
                 continue
 
             freqs, mag, fs, nfft = fft_data
+            freqs, mag, y_label = transform_fft_for_display(freqs, mag, display_mode)
             mask = (freqs >= min_freq) & (freqs <= max_freq)
             if not mask.any():
                 st.write(f"{loc_name}: no frequencies between {min_freq} and {max_freq} Hz, skipping.")
@@ -355,7 +465,8 @@ def main():
                 x=freqs[mask],
                 y=mag[mask],
                 mode="lines",
-                name=f"{loc_name} ({desired_orientation}) — {selected_run}",
+                # name=f"{loc_name} ({desired_orientation}) — {selected_run}",
+                name=trace_label,
             ))
             n_traces += 1
 
@@ -372,6 +483,7 @@ def main():
                     continue
 
                 freqs, mag, fs, nfft = fft_data
+                freqs, mag, y_label = transform_fft_for_display(freqs, mag, display_mode)
                 mask = (freqs >= min_freq) & (freqs <= max_freq)
                 if not mask.any():
                     continue
@@ -380,7 +492,8 @@ def main():
                     x=freqs[mask],
                     y=mag[mask],
                     mode="lines",
-                    name=f"{loc_name} ({desired_orientation}) — {rk}",
+                    # name=f"{loc_name} ({desired_orientation}) — {rk}",
+                    name=f"{trace_label} — {rk}",
                 ))
                 n_traces += 1
 
@@ -389,12 +502,24 @@ def main():
         st.warning("No FFT traces to display with the current selection.")
         return
 
+    if mode == "Select run":
+        run_info = f"Run: {selected_run}"
+    elif mode == "Compare two runs":
+        run_info = f"Runs: {run_a} vs {run_b}"
+    else:  # Latest per location
+        if len(used_run_keys) == 1:
+            run_info = f"Latest run: {next(iter(used_run_keys))}"
+        elif len(used_run_keys) > 1:
+            run_info = f"Latest runs: {', '.join(sorted(used_run_keys))}"
+        else:
+            run_info = "Latest per location"
 
-    title = f"FFT Comparison — {site} / {pump_name} — {desired_orientation.capitalize()}"
+    title = f"FFT Comparison — {site} / {pump_name} — {desired_orientation.capitalize()} — {run_info}"
+
     fig.update_layout(
         title=title,
         xaxis_title="Frequency (Hz)",
-        yaxis_title="Magnitude (g)",
+        yaxis_title=y_label,
         template="plotly_white",
         height=700,  # make the chart taller
         margin=dict(t=80, b=40, l=60, r=200),  # extra top + right for title + legend

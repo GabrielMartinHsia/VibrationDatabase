@@ -1,7 +1,38 @@
 import sqlite3
+import re
 from pathlib import Path
 import yaml
 from .schema import SCHEMA_SQL
+
+_RUN_RE = re.compile(r"(?P<yymmdd>\d{6})_R(?P<run>\d{2})_L(?P<loc>\d{2})", re.IGNORECASE)
+_OLD_RE = re.compile(r"(?P<yymmdd>\d{6})_(?P<hms>\d{6})_L(?P<loc>\d{2})", re.IGNORECASE)
+
+def infer_sort_key_from_ide_path(ide_file_path: str):
+    """
+    Returns a tuple that sorts newer measurements first when used with max(...).
+    Supports:
+      YYMMDD_R##_(...)  -> (yymmdd, run, 0)
+      YYMMDD_HHMMSS_(...) -> (yymmdd, hms, 1)
+    Fallback:
+      None
+    """
+    name = Path(ide_file_path).name
+
+    m = _RUN_RE.search(name)
+    if m:
+        yymmdd = int(m.group("yymmdd"))
+        run = int(m.group("run"))
+        # 0 = preferred format
+        return (yymmdd, run, 0)
+
+    m = _OLD_RE.search(name)
+    if m:
+        yymmdd = int(m.group("yymmdd"))
+        hms = int(m.group("hms"))
+        # 1 = older format (still sortable)
+        return (yymmdd, hms, 1)
+
+    return None
 
 
 def load_config(config_path: str | Path = "config.yaml") -> dict:

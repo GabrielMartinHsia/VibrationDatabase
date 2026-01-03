@@ -135,7 +135,7 @@ def main():
 
         location_id = get_location_id(conn, site, pump_name, loc_name)
 
-        # Timestamp from file modification time (same as your current script)
+        # Timestamp from file modification time (same as current script)
         mtime = ide_path.stat().st_mtime
         timestamp = datetime.utcfromtimestamp(mtime).isoformat() + "Z"
 

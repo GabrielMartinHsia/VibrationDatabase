@@ -57,6 +57,35 @@ def get_sweeps_for_location(conn, location_id: int):
     )
     return cur.fetchall()
 
+def get_location_orientation_map(conn, location_id: int):
+    """
+    Returns dict like {"vertical": "X", "horizontal": "Y", "axial": "Z"} for this location.
+    Only includes orientations that are defined for the location.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT x_dir, y_dir, z_dir
+        FROM measurement_location
+        WHERE location_id = ?
+        """,
+        (location_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return {}
+
+    x_dir, y_dir, z_dir = row
+
+    m = {}
+    if x_dir:
+        m[str(x_dir).lower()] = "X"
+    if y_dir:
+        m[str(y_dir).lower()] = "Y"
+    if z_dir:
+        m[str(z_dir).lower()] = "Z"
+    return m
+
 
 # ---------------- IDE loading ----------------
 
@@ -158,38 +187,6 @@ def accel_to_velocity_in_s(mag_accel_g: np.ndarray, freqs_hz: np.ndarray) -> np.
     vel = (mag_accel_g * g_to_m_s2) / (2 * np.pi * safe_f[:, None]) * m_to_mm * mm_to_in
     vel[0, :] = 0.0
     return vel
-
-
-# def downsample_2d(freqs, times, Z, max_time_slices: int, max_freq_bins: int):
-#     """
-#     Downsample the waterfall for responsiveness.
-#     """
-#     # time downsample
-#     if Z.shape[1] > max_time_slices:
-#         step = int(np.ceil(Z.shape[1] / max_time_slices))
-#         times = times[::step]
-#         Z = Z[:, ::step]
-
-#     # freq downsample
-#     if Z.shape[0] > max_freq_bins:
-#         step = int(np.ceil(Z.shape[0] / max_freq_bins))
-#         freqs = freqs[::step]
-#         Z = Z[::step, :]
-
-#     return freqs, times, Z
-
-# def downsample_freq_stable(freqs_full, freqs_view, Z_view, max_freq_bins: int):
-#     """
-#     Downsample frequency using a stride based on the FULL spectrum length,
-#     so the stride doesn't change dramatically as you adjust fmin/fmax.
-#     """
-#     if max_freq_bins <= 0:
-#         return freqs_view, Z_view
-
-#     stride = int(np.ceil(len(freqs_full) / max_freq_bins))
-#     stride = max(1, stride)
-
-#     return freqs_view[::stride], Z_view[::stride, :]
 
 
 def downsample_freq_maxhold(freqs_full, freqs_view, Z_view, max_freq_bins: int):
@@ -335,7 +332,6 @@ def main():
 
     loc_rows = get_locations_for_machine(conn, site, machine)
     loc_label = {loc_id: name for loc_id, name in loc_rows}
-    # loc_id = st.sidebar.selectbox("Location", [r[0] for r in loc_rows], format_func=lambda i: loc_label[i])
     loc_ids = [r[0] for r in loc_rows]
     loc_id = st.sidebar.selectbox(
         "Location",
@@ -358,7 +354,6 @@ def main():
         reading_id, ts, path = r
         return f"{ts} — {Path(path).name} (id={reading_id})"
 
-    # reading_id, ts, rel_path = st.sidebar.selectbox("Sweep recording", sweeps, format_func=fmt_sweep)
     reading_id, ts, rel_path = st.sidebar.selectbox(
         "Sweep recording",
         sweeps,
@@ -367,7 +362,36 @@ def main():
     )
 
 
-    axis = st.sidebar.selectbox("Axis", ["X", "Y", "Z"], index=2)
+    # axis = st.sidebar.selectbox("Axis", ["X", "Y", "Z"], index=2)
+    orient_map = get_location_orientation_map(conn, loc_id)
+
+    # Only offer orientations that exist for this location
+    orient_options = []
+    for o in ["vertical", "horizontal", "axial"]:
+        if o in orient_map:
+            orient_options.append(o)
+
+    # If DB doesn't have mapping yet, fall back to X/Y/Z
+    if not orient_options:
+        st.sidebar.warning("No orientation mapping found for this location. Falling back to X/Y/Z.")
+        axis = st.sidebar.selectbox("Axis", ["X", "Y", "Z"], index=2)
+        desired_orientation_label = axis
+    else:
+        # Pretty labels
+        label_map = {"vertical": "Vertical", "horizontal": "Horizontal", "axial": "Axial"}
+
+        desired_orientation = st.sidebar.selectbox(
+            "Orientation",
+            orient_options,
+            format_func=lambda o: label_map.get(o, o),
+            index=0 if "vertical" in orient_options else 0,
+            key=f"orient_{site}_{machine}_{loc_id}_{reading_id}",
+        )
+
+        axis = orient_map[desired_orientation]  # "X" / "Y" / "Z"
+        desired_orientation_label = label_map.get(desired_orientation, desired_orientation)
+
+
     data_type = st.sidebar.radio("Display", ["Acceleration (g)", "Velocity (in/s)"], index=0)
 
     view_mode = st.sidebar.radio("View", ["2D Heatmap", "3D Surface"], index=1)
@@ -378,7 +402,7 @@ def main():
         max_value=10.0,
         value=2.0,
         step=0.5,
-        help="Values below this percentage of max are rendered white",
+        help="Values below this percentage of max are rendered white in 3D surface mode",
     )
 
 
@@ -397,25 +421,50 @@ def main():
         "Max frequency (Hz)",
         min_value=10.0,
         max_value=5000.0,
-        value=2000.0,
+        value=2500.0,
         step=10.0,
     )
 
 
-    win_s = st.sidebar.select_slider("Window (s)", options=[0.25, 0.5, 1.0, 2.0, 4.0], value=1.0)
+    # win_s = st.sidebar.select_slider("Window (s)", options=[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 10.0], value=8.0)
+    win_s = st.sidebar.slider("Window (s)", 1, 10, 10, 1)
     overlap_pct = st.sidebar.slider("Overlap (%)", 0, 95, 75, 5)
 
     # Responsiveness controls (important for 3D)
     max_time_slices = st.sidebar.slider("Max time slices (performance)", 50, 400, 180, 10)
-    max_freq_bins = st.sidebar.slider("Max freq bins (performance)", 100, 1200, 1200, 50)
+    max_freq_bins = st.sidebar.slider("Max freq bins (performance)", 100, 3000, 3000, 50)
+
+    st.sidebar.markdown("### Time window (view clip)")
+
+    t_start = st.sidebar.number_input(
+        "Start time (s)",
+        min_value=0.0,
+        value=0.0,
+        step=1.0,
+        format="%.1f",
+        key=f"t_start_{site}_{machine}_{loc_id}_{reading_id}",
+    )
+
+    t_end = st.sidebar.number_input(
+        "End time (s) (0 = end)",
+        min_value=0.0,
+        value=0.0,
+        step=1.0,
+        format="%.1f",
+        key=f"t_end_{site}_{machine}_{loc_id}_{reading_id}",
+    )
+
 
     abs_path = data_root / rel_path
     if not abs_path.exists():
         st.error(f"IDE file not found on disk: {abs_path}")
         return
 
-    # st.caption(f"**{site}/{machine}** — {loc_label[loc_id]} — {Path(rel_path).name}")
-    st.caption(f"**{site}/{machine}** — {loc_label.get(loc_id, loc_id)} — {Path(rel_path).name}")
+    # st.caption(f"**{site}/{machine}** — {loc_label.get(loc_id, loc_id)} — {Path(rel_path).name}")
+    st.caption(
+        f"**{site}/{machine}** — {loc_label.get(loc_id, loc_id)} — {desired_orientation_label} — {Path(rel_path).name}"
+    )
+
 
 
     with st.spinner("Loading IDE time series..."):
@@ -428,9 +477,7 @@ def main():
     x = axes[axis]
 
 
-    
     with st.spinner("Computing / loading STFT (waterfall)..."):
-        # Compute once (cached) per file+axis+window+overlap
         freqs_full, times_full, mag_full, fs = cached_stft(
             str(abs_path),
             axis,
@@ -438,10 +485,26 @@ def main():
             int(overlap_pct),
         )
 
-        # Clip view band (cheap)
-        mask = (freqs_full >= float(fmin)) & (freqs_full <= float(fmax))
-        freqs_view = freqs_full[mask]
-        mag_view = mag_full[mask, :]
+        # Resolve t_end: 0 means "end of sweep"
+        t_total = float(times_full[-1]) if len(times_full) else 0.0
+        t_end_effective = t_total if (t_end is None or float(t_end) <= 0.0) else float(t_end)
+
+        # Clamp + validate
+        t_start_effective = float(np.clip(float(t_start), 0.0, t_total))
+        t_end_effective = float(np.clip(t_end_effective, 0.0, t_total))
+        if t_end_effective <= t_start_effective:
+            t_start_effective = 0.0
+            t_end_effective = t_total
+
+        # Clip TIME first (cheap)
+        time_mask = (times_full >= t_start_effective) & (times_full <= t_end_effective)
+        times_view = times_full[time_mask]
+        mag_time = mag_full[:, time_mask]   # (freq x time)
+
+        # Clip FREQ band (cheap)
+        freq_mask = (freqs_full >= float(fmin)) & (freqs_full <= float(fmax))
+        freqs_view = freqs_full[freq_mask]
+        mag_view = mag_time[freq_mask, :]
 
         # Convert (cheap)
         if data_type.startswith("Velocity"):
@@ -453,10 +516,10 @@ def main():
 
         # Downsample TIME (cheap)
         freqs_view, times_view, Z_view = downsample_time_only(
-            freqs_view, times_full, Z_view, max_time_slices=max_time_slices
+            freqs_view, times_view, Z_view, max_time_slices=max_time_slices
         )
 
-        # Downsample FREQ with stable stride (cheap + consistent)
+        # Downsample FREQ (max-hold, preserves peaks)
         freqs_view, Z_view = downsample_freq_maxhold(
             freqs_full=freqs_full,
             freqs_view=freqs_view,
@@ -464,11 +527,22 @@ def main():
             max_freq_bins=max_freq_bins,
         )
 
-        # Final outputs used by plots
         freqs, times, Z = freqs_view, times_view, Z_view
 
 
-    title = f"Waterfall — {site}/{machine} {loc_label[loc_id]} — {axis} — {data_type} — {fmin:.1f}-{fmax:.1f} Hz"
+    st.sidebar.markdown("### Time window (view clip)")
+
+
+    # title = (
+    #     f"Waterfall — {site}/{machine} {loc_label.get(loc_id, loc_id)} — {axis} — {data_type}\n"
+    #     f"{t_start_effective:.1f}–{t_end_effective:.1f} s, {fmin:.1f}–{fmax:.1f} Hz"
+    # )
+    title = (
+        f"Waterfall — {site}/{machine} {loc_label.get(loc_id, loc_id)} — {desired_orientation_label} — {data_type}\n"
+        f"{t_start_effective:.1f}–{t_end_effective:.1f} s, {fmin:.1f}–{fmax:.1f} Hz"
+    )
+
+
 
     if view_mode == "3D Surface":
         fig = make_surface_figure(freqs, times, Z, white_floor_pct, title=title, z_label=z_label)
